@@ -1,0 +1,26 @@
+# Node dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build outputs
+dist/
+dist-ssr/
+
+# Local environment & IDE
+.env
+.env.local
+.env.*.local
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Specifically ignored GeoJSON files
+vasavi_map.geojson
+**/vasavi_map.geojson
+*.geojson
+
+# Avoid duplicating satellite tiles (served directly from /satellite_tiles)
+public/satellite_tiles
