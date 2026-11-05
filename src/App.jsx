@@ -358,8 +358,18 @@ export default function App() {
   };
 
   const handleEditPlotGeometry = (fid, newGeometry) => {
+    handleEditPlotsGeometry([{ fid, geometry: newGeometry }]);
+  };
+
+  const handleEditPlotsGeometry = (updates) => {
+    if (!updates || updates.length === 0) return;
+    const updateMap = new Map();
+    updates.forEach(u => updateMap.set(String(u.fid), u.geometry));
+
     const nextFeatures = features.map(f => {
-      if (String(f.properties?.fid) === String(fid)) {
+      const fidStr = String(f.properties?.fid);
+      if (updateMap.has(fidStr)) {
+        const newGeometry = updateMap.get(fidStr);
         let finalGeo = newGeometry;
         if (f.geometry?.type === 'MultiPolygon' && newGeometry?.type === 'Polygon') {
           finalGeo = {
@@ -371,9 +381,13 @@ export default function App() {
       }
       return f;
     });
+
     setFeatures(nextFeatures);
-    recordHistory(`Reshape Plot [${fid}]`, nextFeatures);
-    showToast(`Reshaped Plot [${fid}]`, '✏️');
+    const label = updates.length === 1
+      ? `Reshape Plot [${updates[0].fid}]`
+      : `Reshape Plots [${updates.map(u => u.fid).join(', ')}]`;
+    recordHistory(label, nextFeatures);
+    showToast(label, '✏️');
   };
 
   const handleMovePlotGeometry = (fid, newGeometry) => {
@@ -639,6 +653,7 @@ export default function App() {
         isAddingPlot={isAddingPlot}
         onFinishDrawingPlot={handleFinishDrawingPlot}
         onEditPlotGeometry={handleEditPlotGeometry}
+        onEditPlotsGeometry={handleEditPlotsGeometry}
         onMovePlotGeometry={handleMovePlotGeometry}
         onDeletePlot={handleDeletePlot}
         onOpenEditModal={handleOpenEditModal}

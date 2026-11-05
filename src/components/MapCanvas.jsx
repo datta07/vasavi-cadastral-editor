@@ -19,6 +19,45 @@ L.Icon.Default.mergeOptions({
   shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
 });
 
+// Helper to flatten nested PM markers
+function flatMarkers(m) {
+  if (!Array.isArray(m)) return [];
+  if (m[0] instanceof L.Marker) return m;
+  return m.flatMap(flatMarkers);
+}
+
+function getDeep(obj, path) {
+  if (!path || path.length === 0) return obj;
+  return path.reduce((acc, key) => (acc ? acc[key] : undefined), obj);
+}
+
+// Helper to update peer middle markers smoothly during topological pinning
+function updatePeerMiddleMarkers(map, peerMarker, peerLayer, newLatLng) {
+  if (!map || !peerLayer.pm || !peerLayer.pm._markers) return;
+  try {
+    const { indexPath, index, parentPath } = L.PM.Utils.findDeepMarkerIndex(peerLayer.pm._markers, peerMarker);
+    if (!indexPath) return;
+    const markerArr = indexPath.length > 1 ? getDeep(peerLayer.pm._markers, parentPath) : peerLayer.pm._markers;
+    if (!markerArr || markerArr.length === 0) return;
+    const nextIndex = (index + 1) % markerArr.length;
+    const prevIndex = (index + (markerArr.length - 1)) % markerArr.length;
+    const nextMarker = markerArr[nextIndex];
+    const prevMarker = markerArr[prevIndex];
+    if (!nextMarker || !prevMarker) return;
+    const nextLatLng = nextMarker.getLatLng();
+    const prevLatLng = prevMarker.getLatLng();
+
+    if (peerMarker._middleMarkerNext) {
+      peerMarker._middleMarkerNext.setLatLng(L.PM.Utils.calcMiddleLatLng(map, newLatLng, nextLatLng));
+    }
+    if (peerMarker._middleMarkerPrev) {
+      peerMarker._middleMarkerPrev.setLatLng(L.PM.Utils.calcMiddleLatLng(map, newLatLng, prevLatLng));
+    }
+  } catch (e) {
+    console.error('Error updating peer middle markers:', e);
+  }
+}
+
 export default function MapCanvas({
   features,
   offsetN,
@@ -26,6 +65,7 @@ export default function MapCanvas({
   isAddingPlot,
   onFinishDrawingPlot,
   onEditPlotGeometry,
+  onEditPlotsGeometry,
   onMovePlotGeometry,
   onDeletePlot,
   onOpenEditModal,
@@ -43,6 +83,11 @@ export default function MapCanvas({
   const mapInstanceRef = useRef(null);
   const plotLayerGroupRef = useRef(null);
   const refLinesGroupRef = useRef(null);
+
+  // Active shared-vertex pinning state and internal edit tracking
+  const activePinnedPeersRef = useRef([]);
+  const isInternalEditRef = useRef(false);
+  const isSyncingPeersRef = useRef(false);
 
   // Ruler state
   const rulerStartRef = useRef(null);
@@ -158,36 +203,9 @@ export default function MapCanvas({
       onFinishDrawingPlot(e.layer);
     };
 
-    const handleEdit = (e) => {
+    const handleRefLinesChange = (e) => {
       const targetLayer = e?.layer || e?.target;
-      const fid = targetLayer?.featureFid;
-      if (fid !== undefined) {
-        const isNewPlot = targetLayer.isNewPlot;
-        const newGeo = targetLayer.toGeoJSON();
-        const dLat = offsetN / METERS_PER_LAT;
-        const dLon = offsetE / METERS_PER_LON;
-        if (!isNewPlot && newGeo.geometry) {
-          newGeo.geometry.coordinates = applyOffsetToCoords(newGeo.geometry.coordinates, -dLat, -dLon);
-        }
-        onEditPlotGeometry(fid, newGeo.geometry);
-      } else if (refLinesGroupRef.current?.hasLayer(targetLayer)) {
-        notifyRefLinesChange();
-      }
-    };
-
-    const handleDragEnd = (e) => {
-      const targetLayer = e?.layer || e?.target;
-      const fid = targetLayer?.featureFid;
-      if (fid !== undefined) {
-        const isNewPlot = targetLayer.isNewPlot;
-        const newGeo = targetLayer.toGeoJSON();
-        const dLat = offsetN / METERS_PER_LAT;
-        const dLon = offsetE / METERS_PER_LON;
-        if (!isNewPlot && newGeo.geometry) {
-          newGeo.geometry.coordinates = applyOffsetToCoords(newGeo.geometry.coordinates, -dLat, -dLon);
-        }
-        onMovePlotGeometry(fid, newGeo.geometry);
-      } else if (refLinesGroupRef.current?.hasLayer(targetLayer)) {
+      if (refLinesGroupRef.current?.hasLayer(targetLayer)) {
         notifyRefLinesChange();
       }
     };
@@ -203,15 +221,7 @@ export default function MapCanvas({
     };
 
     map.on('pm:create', handleCreate);
-    map.on('pm:edit', handleEdit);
-    map.on('pm:dragend', handleDragEnd);
     map.on('pm:remove', handleRemove);
-
-    if (plotGroup) {
-      plotGroup.on('pm:edit', handleEdit);
-      plotGroup.on('pm:dragend', handleDragEnd);
-      plotGroup.on('pm:remove', handleRemove);
-    }
 
     if (refLinesGroup) {
       refLinesGroup.on('pm:edit', notifyRefLinesChange);
@@ -221,21 +231,14 @@ export default function MapCanvas({
 
     return () => {
       map.off('pm:create', handleCreate);
-      map.off('pm:edit', handleEdit);
-      map.off('pm:dragend', handleDragEnd);
       map.off('pm:remove', handleRemove);
-      if (plotGroup) {
-        plotGroup.off('pm:edit', handleEdit);
-        plotGroup.off('pm:dragend', handleDragEnd);
-        plotGroup.off('pm:remove', handleRemove);
-      }
       if (refLinesGroup) {
         refLinesGroup.off('pm:edit', notifyRefLinesChange);
         refLinesGroup.off('pm:dragend', notifyRefLinesChange);
         refLinesGroup.off('pm:remove', notifyRefLinesChange);
       }
     };
-  }, [offsetN, offsetE, onFinishDrawingPlot, onEditPlotGeometry, onMovePlotGeometry, onDeletePlot]);
+  }, [onFinishDrawingPlot, onDeletePlot, onUpdateReferenceLines]);
 
   // Helper for guide lines
   const notifyRefLinesChange = () => {
@@ -290,6 +293,13 @@ export default function MapCanvas({
     const map = mapInstanceRef.current;
     if (!group || !map) return;
 
+    // Skip full layer destroy & rebuild if change was produced in-place by Geoman
+    if (isInternalEditRef.current) {
+      isInternalEditRef.current = false;
+      return;
+    }
+
+    const wasEditEnabled = map.pm ? map.pm.globalEditModeEnabled() : false;
     group.clearLayers();
     const dLat = offsetN / METERS_PER_LAT;
     const dLon = offsetE / METERS_PER_LON;
@@ -314,31 +324,121 @@ export default function MapCanvas({
           sublayer.featureFid = p.fid;
           sublayer.isNewPlot = isNewPlot;
 
-          let editTimer = null;
-          const syncLayerGeometry = (actionType = 'Reshape') => {
-            if (editTimer) clearTimeout(editTimer);
-            editTimer = setTimeout(() => {
-              const fid = sublayer.featureFid;
-              if (fid === undefined) return;
-              const newGeo = sublayer.toGeoJSON();
-              const dLat = offsetN / METERS_PER_LAT;
-              const dLon = offsetE / METERS_PER_LON;
-              if (!sublayer.isNewPlot && newGeo.geometry) {
-                newGeo.geometry.coordinates = applyOffsetToCoords(newGeo.geometry.coordinates, -dLat, -dLon);
+          // --- TOPOLOGICAL SHARED-VERTEX PINNING ENGINE ---
+          sublayer.on('pm:markerdragstart', (e) => {
+            const marker = e.markerEvent?.target;
+            if (!marker || !marker.getLatLng) return;
+
+            const startPos = marker.getLatLng();
+            activePinnedPeersRef.current = [];
+
+            const currentGroup = plotLayerGroupRef.current;
+            if (!currentGroup) return;
+
+            const allPolyLayers = [];
+            currentGroup.eachLayer(l => {
+              if (l.getLayers) l.eachLayer(s => { if (s instanceof L.Polygon) allPolyLayers.push(s); });
+              else if (l instanceof L.Polygon) allPolyLayers.push(l);
+            });
+
+            allPolyLayers.forEach(peerLayer => {
+              if (peerLayer === sublayer || !peerLayer.pm || !peerLayer.pm._markers) return;
+              const markers = flatMarkers(peerLayer.pm._markers);
+              markers.forEach(m => {
+                if (m.getLatLng().distanceTo(startPos) < 0.05) {
+                  // Ignore peer during snapping to prevent magnetic self-lock
+                  m.options.snapIgnore = true;
+                  activePinnedPeersRef.current.push({ marker: m, layer: peerLayer });
+                }
+              });
+            });
+          });
+
+          sublayer.on('pm:markerdrag', (e) => {
+            if (isSyncingPeersRef.current) return;
+            const marker = e.markerEvent?.target;
+            if (!marker || activePinnedPeersRef.current.length === 0) return;
+
+            const currentPos = marker.getLatLng();
+            isSyncingPeersRef.current = true;
+            try {
+              activePinnedPeersRef.current.forEach(({ marker: peerMarker, layer: peerLayer }) => {
+                peerMarker.setLatLng(currentPos);
+                if (peerLayer.pm?.updatePolygonCoordsFromMarkerDrag) {
+                  peerLayer.pm.updatePolygonCoordsFromMarkerDrag(peerMarker);
+                }
+                updatePeerMiddleMarkers(map, peerMarker, peerLayer, currentPos);
+                peerLayer.redraw();
+              });
+            } finally {
+              isSyncingPeersRef.current = false;
+            }
+          });
+
+          sublayer.on('pm:markerdragend', (e) => {
+            if (isSyncingPeersRef.current) return;
+            const marker = e.markerEvent?.target;
+            if (!marker) return;
+
+            const finalPos = marker.getLatLng();
+            isSyncingPeersRef.current = true;
+            try {
+              activePinnedPeersRef.current.forEach(({ marker: peerMarker, layer: peerLayer }) => {
+                peerMarker.setLatLng(finalPos);
+                if (peerLayer.pm?.updatePolygonCoordsFromMarkerDrag) {
+                  peerLayer.pm.updatePolygonCoordsFromMarkerDrag(peerMarker);
+                }
+                updatePeerMiddleMarkers(map, peerMarker, peerLayer, finalPos);
+                peerMarker.options.snapIgnore = false;
+                peerLayer.redraw();
+              });
+
+              const allAffected = [sublayer, ...activePinnedPeersRef.current.map(p => p.layer)];
+              activePinnedPeersRef.current = [];
+
+              const currDLat = offsetN / METERS_PER_LAT;
+              const currDLon = offsetE / METERS_PER_LON;
+              const updates = allAffected.map(l => {
+                const newGeo = l.toGeoJSON();
+                if (!l.isNewPlot && newGeo.geometry) {
+                  newGeo.geometry.coordinates = applyOffsetToCoords(newGeo.geometry.coordinates, -currDLat, -currDLon);
+                }
+                return { fid: l.featureFid, geometry: newGeo.geometry };
+              });
+
+              isInternalEditRef.current = true;
+              if (onEditPlotsGeometry) {
+                onEditPlotsGeometry(updates);
+              } else if (onEditPlotGeometry) {
+                updates.forEach(u => onEditPlotGeometry(u.fid, u.geometry));
               }
-              if (actionType === 'Move') {
-                onMovePlotGeometry(fid, newGeo.geometry);
-              } else {
-                onEditPlotGeometry(fid, newGeo.geometry);
-              }
-            }, 30);
+            } finally {
+              isSyncingPeersRef.current = false;
+            }
+          });
+
+          const syncSingleLayer = (actionType = 'Reshape') => {
+            const fid = sublayer.featureFid;
+            if (fid === undefined) return;
+            const newGeo = sublayer.toGeoJSON();
+            const currDLat = offsetN / METERS_PER_LAT;
+            const currDLon = offsetE / METERS_PER_LON;
+            if (!sublayer.isNewPlot && newGeo.geometry) {
+              newGeo.geometry.coordinates = applyOffsetToCoords(newGeo.geometry.coordinates, -currDLat, -currDLon);
+            }
+            isInternalEditRef.current = true;
+            if (actionType === 'Move') {
+              onMovePlotGeometry(fid, newGeo.geometry);
+            } else if (onEditPlotsGeometry) {
+              onEditPlotsGeometry([{ fid, geometry: newGeo.geometry }]);
+            } else if (onEditPlotGeometry) {
+              onEditPlotGeometry(fid, newGeo.geometry);
+            }
           };
 
-          sublayer.on('pm:markerdragend', () => syncLayerGeometry('Reshape'));
-          sublayer.on('pm:vertexadded', () => syncLayerGeometry('Reshape'));
-          sublayer.on('pm:vertexremoved', () => syncLayerGeometry('Reshape'));
-          sublayer.on('pm:edit', () => syncLayerGeometry('Reshape'));
-          sublayer.on('pm:dragend', () => syncLayerGeometry('Move'));
+          sublayer.on('pm:vertexadded', () => syncSingleLayer('Reshape'));
+          sublayer.on('pm:vertexremoved', () => syncSingleLayer('Reshape'));
+          sublayer.on('pm:dragend', () => syncSingleLayer('Move'));
 
           sublayer.bindTooltip(`<b>[${p.fid || 'N/A'}] ${p.owner_name || 'Unassigned'}</b><br>${p.reg_doc_no || 'No Doc'}`, {
             sticky: true,
@@ -392,7 +492,11 @@ export default function MapCanvas({
       layer.featureFid = p.fid;
       group.addLayer(layer);
     });
-  }, [features, offsetN, offsetE, onOpenEditModal, onDeletePlot, onEditPlotGeometry, onMovePlotGeometry]);
+
+    if (wasEditEnabled && map.pm) {
+      map.pm.enableGlobalEditMode();
+    }
+  }, [features, offsetN, offsetE, onOpenEditModal, onDeletePlot, onEditPlotGeometry, onEditPlotsGeometry, onMovePlotGeometry]);
 
   // 4. Synchronize reference lines from props
   useEffect(() => {

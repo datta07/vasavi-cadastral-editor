@@ -564,6 +564,48 @@
 
     const plotLayerGroup = L.featureGroup().addTo(map);
     const referenceLinesGroup = L.featureGroup().addTo(map);
+    window.map = map;
+    window.plotLayerGroup = plotLayerGroup;
+
+    function flatMarkers(m) {
+      if (!Array.isArray(m)) return [];
+      if (m[0] instanceof L.Marker) return m;
+      return m.flatMap(flatMarkers);
+    }
+
+    function getDeep(obj, path) {
+      if (!path || path.length === 0) return obj;
+      return path.reduce((acc, key) => (acc ? acc[key] : undefined), obj);
+    }
+
+    function updatePeerMiddleMarkers(peerMarker, peerLayer, newLatLng) {
+      if (!map || !peerLayer.pm || !peerLayer.pm._markers) return;
+      try {
+        const { indexPath, index, parentPath } = L.PM.Utils.findDeepMarkerIndex(peerLayer.pm._markers, peerMarker);
+        if (!indexPath) return;
+        const markerArr = indexPath.length > 1 ? getDeep(peerLayer.pm._markers, parentPath) : peerLayer.pm._markers;
+        if (!markerArr || markerArr.length === 0) return;
+        const nextIndex = (index + 1) % markerArr.length;
+        const prevIndex = (index + (markerArr.length - 1)) % markerArr.length;
+        const nextMarker = markerArr[nextIndex];
+        const prevMarker = markerArr[prevIndex];
+        if (!nextMarker || !prevMarker) return;
+        const nextLatLng = nextMarker.getLatLng();
+        const prevLatLng = prevMarker.getLatLng();
+
+        if (peerMarker._middleMarkerNext) {
+          peerMarker._middleMarkerNext.setLatLng(L.PM.Utils.calcMiddleLatLng(map, newLatLng, nextLatLng));
+        }
+        if (peerMarker._middleMarkerPrev) {
+          peerMarker._middleMarkerPrev.setLatLng(L.PM.Utils.calcMiddleLatLng(map, newLatLng, prevLatLng));
+        }
+      } catch (e) {
+        console.error('Error updating peer middle markers:', e);
+      }
+    }
+
+    let activePinnedPeers = [];
+    let isSyncingPeers = false;
 
     function applyOffsetToCoords(coords, dLat, dLon) {
       if (typeof coords[0] === 'number') {
@@ -602,37 +644,133 @@
               direction: 'top'
             });
 
-            let editSyncTimer = null;
-            const syncGeometry = () => {
-              if (editSyncTimer) clearTimeout(editSyncTimer);
-              editSyncTimer = setTimeout(() => {
-                const targetFid = sublayer.featureFid;
-                if (targetFid === undefined) return;
-                const newGeo = sublayer.toGeoJSON();
+            // --- TOPOLOGICAL SHARED-VERTEX PINNING ENGINE ---
+            sublayer.on('pm:markerdragstart', (e) => {
+              const marker = e.markerEvent?.target;
+              if (!marker || !marker.getLatLng) return;
+
+              const startPos = marker.getLatLng();
+              activePinnedPeers = [];
+
+              const allPolyLayers = [];
+              plotLayerGroup.eachLayer(l => {
+                if (l.getLayers) l.eachLayer(s => { if (s instanceof L.Polygon) allPolyLayers.push(s); });
+                else if (l instanceof L.Polygon) allPolyLayers.push(l);
+              });
+
+              allPolyLayers.forEach(peerLayer => {
+                if (peerLayer === sublayer || !peerLayer.pm || !peerLayer.pm._markers) return;
+                const markers = flatMarkers(peerLayer.pm._markers);
+                markers.forEach(m => {
+                  if (m.getLatLng().distanceTo(startPos) < 0.05) {
+                    m.options.snapIgnore = true;
+                    activePinnedPeers.push({ marker: m, layer: peerLayer });
+                  }
+                });
+              });
+            });
+
+            sublayer.on('pm:markerdrag', (e) => {
+              if (isSyncingPeers) return;
+              const marker = e.markerEvent?.target;
+              if (!marker || activePinnedPeers.length === 0) return;
+
+              const currentPos = marker.getLatLng();
+              isSyncingPeers = true;
+              try {
+                activePinnedPeers.forEach(({ marker: peerMarker, layer: peerLayer }) => {
+                  peerMarker.setLatLng(currentPos);
+                  if (peerLayer.pm?.updatePolygonCoordsFromMarkerDrag) {
+                    peerLayer.pm.updatePolygonCoordsFromMarkerDrag(peerMarker);
+                  }
+                  updatePeerMiddleMarkers(peerMarker, peerLayer, currentPos);
+                  peerLayer.redraw();
+                });
+              } finally {
+                isSyncingPeers = false;
+              }
+            });
+
+            sublayer.on('pm:markerdragend', (e) => {
+              if (isSyncingPeers) return;
+              const marker = e.markerEvent?.target;
+              if (!marker) return;
+
+              const finalPos = marker.getLatLng();
+              isSyncingPeers = true;
+              try {
+                activePinnedPeers.forEach(({ marker: peerMarker, layer: peerLayer }) => {
+                  peerMarker.setLatLng(finalPos);
+                  if (peerLayer.pm?.updatePolygonCoordsFromMarkerDrag) {
+                    peerLayer.pm.updatePolygonCoordsFromMarkerDrag(peerMarker);
+                  }
+                  updatePeerMiddleMarkers(peerMarker, peerLayer, finalPos);
+                  peerMarker.options.snapIgnore = false;
+                  peerLayer.redraw();
+                });
+
+                const allAffected = [sublayer, ...activePinnedPeers.map(p => p.layer)];
+                activePinnedPeers = [];
+
                 const dLat = totalOffsetNorthMeters / METERS_PER_LAT;
                 const dLon = totalOffsetEastMeters / METERS_PER_LON;
-                if (!sublayer.isNewPlot && newGeo.geometry) {
-                  newGeo.geometry.coordinates = applyOffsetToCoords(newGeo.geometry.coordinates, -dLat, -dLon);
-                }
-                const feat = currentFeatures.find(f => String(f.properties?.fid) === String(targetFid));
-                if (feat && newGeo.geometry) {
-                  if (feat.geometry?.type === 'MultiPolygon' && newGeo.geometry?.type === 'Polygon') {
-                    feat.geometry = { type: 'MultiPolygon', coordinates: [newGeo.geometry.coordinates] };
-                  } else {
-                    feat.geometry = newGeo.geometry;
+
+                const affectedFids = [];
+                allAffected.forEach(l => {
+                  const targetFid = l.featureFid;
+                  if (targetFid === undefined) return;
+                  const newGeo = l.toGeoJSON();
+                  if (!l.isNewPlot && newGeo.geometry) {
+                    newGeo.geometry.coordinates = applyOffsetToCoords(newGeo.geometry.coordinates, -dLat, -dLon);
                   }
-                  saveState();
-                  historyManager.record(`Reshape Plot [${targetFid}]`, getSnapshot);
-                  showToast(`Reshaped Plot [${targetFid}]`, '✏️');
+                  const feat = currentFeatures.find(f => String(f.properties?.fid) === String(targetFid));
+                  if (feat && newGeo.geometry) {
+                    if (feat.geometry?.type === 'MultiPolygon' && newGeo.geometry?.type === 'Polygon') {
+                      feat.geometry = { type: 'MultiPolygon', coordinates: [newGeo.geometry.coordinates] };
+                    } else {
+                      feat.geometry = newGeo.geometry;
+                    }
+                    affectedFids.push(targetFid);
+                  }
+                });
+
+                saveState();
+                const label = affectedFids.length === 1
+                  ? `Reshape Plot [${affectedFids[0]}]`
+                  : `Reshape Plots [${affectedFids.join(', ')}]`;
+                historyManager.record(label, getSnapshot);
+                showToast(label, '✏️');
+              } finally {
+                isSyncingPeers = false;
+              }
+            });
+
+            const syncSingleLayer = (actionType = 'Reshape') => {
+              const targetFid = sublayer.featureFid;
+              if (targetFid === undefined) return;
+              const newGeo = sublayer.toGeoJSON();
+              const dLat = totalOffsetNorthMeters / METERS_PER_LAT;
+              const dLon = totalOffsetEastMeters / METERS_PER_LON;
+              if (!sublayer.isNewPlot && newGeo.geometry) {
+                newGeo.geometry.coordinates = applyOffsetToCoords(newGeo.geometry.coordinates, -dLat, -dLon);
+              }
+              const feat = currentFeatures.find(f => String(f.properties?.fid) === String(targetFid));
+              if (feat && newGeo.geometry) {
+                if (feat.geometry?.type === 'MultiPolygon' && newGeo.geometry?.type === 'Polygon') {
+                  feat.geometry = { type: 'MultiPolygon', coordinates: [newGeo.geometry.coordinates] };
+                } else {
+                  feat.geometry = newGeo.geometry;
                 }
-              }, 30);
+                saveState();
+                const actionLabel = actionType === 'Move' ? `Move Plot [${targetFid}]` : `Reshape Plot [${targetFid}]`;
+                historyManager.record(actionLabel, getSnapshot);
+                showToast(actionLabel, actionType === 'Move' ? '✋' : '✏️');
+              }
             };
 
-            sublayer.on('pm:markerdragend', syncGeometry);
-            sublayer.on('pm:vertexadded', syncGeometry);
-            sublayer.on('pm:vertexremoved', syncGeometry);
-            sublayer.on('pm:edit', syncGeometry);
-            sublayer.on('pm:dragend', syncGeometry);
+            sublayer.on('pm:vertexadded', () => syncSingleLayer('Reshape'));
+            sublayer.on('pm:vertexremoved', () => syncSingleLayer('Reshape'));
+            sublayer.on('pm:dragend', () => syncSingleLayer('Move'));
 
             sublayer.on('click', () => {
               L.popup()
@@ -1055,48 +1193,16 @@
       setTimeout(() => document.getElementById('prop_owner').focus(), 100);
     });
 
-    // Geoman edit / drag synchronization
+    // Reference guide lines edit / drag synchronization
     map.on('pm:edit', (e) => {
-      const targetFid = e.layer?.featureFid;
-      if (targetFid !== undefined) {
-        const isNewPlot = e.layer.isNewPlot;
-        const newGeo = e.layer.toGeoJSON();
-        const dLat = totalOffsetNorthMeters / METERS_PER_LAT;
-        const dLon = totalOffsetEastMeters / METERS_PER_LON;
-        if (!isNewPlot && newGeo.geometry) {
-          newGeo.geometry.coordinates = applyOffsetToCoords(newGeo.geometry.coordinates, -dLat, -dLon);
-        }
-        const feat = currentFeatures.find(f => String(f.properties?.fid) === String(targetFid));
-        if (feat && newGeo.geometry) {
-          feat.geometry = newGeo.geometry;
-          saveState();
-          historyManager.record(`Reshape Plot [${targetFid}]`, getSnapshot);
-          showToast(`Reshaped Plot [${targetFid}]`, '✏️');
-        }
-      } else if (referenceLinesGroup.hasLayer(e.layer)) {
+      if (referenceLinesGroup.hasLayer(e.layer)) {
         saveReferenceLines();
         historyManager.record('Edit Guide Line', getSnapshot);
       }
     });
 
     map.on('pm:dragend', (e) => {
-      const targetFid = e.layer?.featureFid;
-      if (targetFid !== undefined) {
-        const isNewPlot = e.layer.isNewPlot;
-        const newGeo = e.layer.toGeoJSON();
-        const dLat = totalOffsetNorthMeters / METERS_PER_LAT;
-        const dLon = totalOffsetEastMeters / METERS_PER_LON;
-        if (!isNewPlot && newGeo.geometry) {
-          newGeo.geometry.coordinates = applyOffsetToCoords(newGeo.geometry.coordinates, -dLat, -dLon);
-        }
-        const feat = currentFeatures.find(f => String(f.properties?.fid) === String(targetFid));
-        if (feat && newGeo.geometry) {
-          feat.geometry = newGeo.geometry;
-          saveState();
-          historyManager.record(`Move Plot [${targetFid}]`, getSnapshot);
-          showToast(`Moved Plot [${targetFid}]`, '✋');
-        }
-      } else if (referenceLinesGroup.hasLayer(e.layer)) {
+      if (referenceLinesGroup.hasLayer(e.layer)) {
         saveReferenceLines();
         historyManager.record('Move Guide Line', getSnapshot);
       }
